@@ -1,0 +1,72 @@
+name: 'Build and Deploy to GKE'
+
+on:
+  push:
+    branches:
+      - main  # ❌ removed extra quotes
+
+env:
+  PROJECT_ID: 'your-project-id'  # ✅ Replace with your actual GCP project ID
+  GAR_LOCATION: 'us-central1'    # ✅ Replace with your region
+  GKE_CLUSTER: 'your-cluster'    # ✅ Replace with your cluster name
+  GKE_ZONE: 'us-central1-c'      # ✅ Replace with your cluster zone
+  DEPLOYMENT_NAME: 'your-deployment-name' # ✅ Match Kubernetes deployment name
+  REPOSITORY: 'your-artifact-repo'  # ✅ Replace with your Artifact Registry name
+  IMAGE: 'your-image-name'      # ✅ E.g., mlops-app
+  WORKLOAD_IDENTITY_PROVIDER: 'projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/my-provider'  # ✅ Replace this
+
+jobs:
+  setup-build-publish-deploy:
+    name: 'Setup, Build, Publish, and Deploy'
+    runs-on: ubuntu-latest
+    environment: production
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: 'Checkout Code'
+        uses: actions/checkout@v4
+
+      - id: 'auth'
+        name: 'Authenticate to Google Cloud'
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: '${{ env.WORKLOAD_IDENTITY_PROVIDER }}'
+          service_account: 'ci-cd-service-account@${{ env.PROJECT_ID }}.iam.gserviceaccount.com' # ✅ Optional: configure your service account
+
+      - name: 'Docker Auth to Artifact Registry'
+        uses: docker/login-action@v3
+        with:
+          username: 'oauth2accesstoken'
+          password: '${{ steps.auth.outputs.access_token }}'
+          registry: '${{ env.GAR_LOCATION }}-docker.pkg.dev'
+
+      - name: 'Get GKE credentials'
+        uses: google-github-actions/get-gke-credentials@v2
+        with:
+          cluster_name: '${{ env.GKE_CLUSTER }}'
+          location: '${{ env.GKE_ZONE }}'
+
+      - name: 'Build and Push Docker image'
+        run: |
+          IMAGE_URI="${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}:${{ github.sha }}"
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+
+      - name: 'Install Kustomize'
+        run: |
+          curl -sLO https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2Fv5.4.3/kustomize_v5.4.3_linux_amd64.tar.gz
+          tar -xzf kustomize_v5.4.3_linux_amd64.tar.gz
+          chmod +x kustomize
+          sudo mv kustomize /usr/local/bin/
+
+      - name: 'Update Kustomize with new image'
+        run: |
+          kustomize edit set image ${IMAGE}=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: 'Deploy to GKE'
+        run: |
+          kustomize build . | kubectl apply -f -
+          kubectl rollout status deployment
